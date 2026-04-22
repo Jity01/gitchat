@@ -1,0 +1,128 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+body {
+  font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: #e4d4ad;
+  color: #2e251b;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "cv11", "ss01", "ss03";
+}
+* { box-sizing: border-box; }
+
+button { font-family: inherit; }
+input, textarea { font-family: inherit; }
+
+/* selection */
+::selection { background: rgba(183,122,60,0.30); color: #2e251b; }
+
+/* xterm */
+.xterm-viewport { scrollbar-width: thin; }
+.xterm-viewport::-webkit-scrollbar { width: 8px; }
+.xterm-viewport::-webkit-scrollbar-thumb { background: #4a4235; border-radius: 4px; }
+
+/* hljs — cream-toned light theme */
+.hljs { color: #2a241c; background: transparent; display: block; overflow-x: auto; }
+.hljs-comment, .hljs-quote { color: #a49780; font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-doctag, .hljs-type {
+  color: #8d6ba5;
+}
+.hljs-string, .hljs-regexp, .hljs-attr, .hljs-symbol, .hljs-bullet, .hljs-link {
+  color: #7a9a5f;
+}
+.hljs-number, .hljs-meta { color: #b77a3c; }
+.hljs-title, .hljs-name, .hljs-selector-id, .hljs-selector-class {
+  color: #6b8db5;
+}
+.hljs-built_in, .hljs-builtin-name, .hljs-params { color: #9a8566; }
+.hljs-variable, .hljs-template-variable { color: #c47d8a; }
+.hljs-tag { color: #6b8db5; }
+.hljs-attribute { color: #b77a3c; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+
+/* markdown preview */
+.md-body {
+  padding: 24px 28px;
+  max-width: 760px;
+  font-size: 14.5px;
+  line-height: 1.65;
+  color: #2e251b;
+}
+.md-body h1, .md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 {
+  font-weight: 600;
+  color: #2e251b;
+  letter-spacing: -0.2px;
+  margin: 1.4em 0 0.5em;
+}
+.md-body h1 { font-size: 1.75em; border-bottom: 1px solid #e4dcca; padding-bottom: 0.25em; }
+.md-body h2 { font-size: 1.35em; border-bottom: 1px solid #e4dcca; padding-bottom: 0.2em; }
+.md-body h3 { font-size: 1.15em; }
+.md-body h4 { font-size: 1em; }
+.md-body p { margin: 0.7em 0; }
+.md-body a { color: #b77a3c; text-decoration: underline; text-decoration-color: rgba(183,122,60,0.4); }
+.md-body a:hover { text-decoration-color: #b77a3c; }
+.md-body ul, .md-body ol { padding-left: 1.4em; margin: 0.6em 0; }
+.md-body li { margin: 0.25em 0; }
+.md-body blockquote {
+  margin: 0.8em 0;
+  padding: 0.2em 1em;
+  border-left: 3px solid #b89f6e;
+  background: #ecdcb9;
+  color: #5f4f33;
+  border-radius: 0 8px 8px 0;
+}
+.md-body code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  background: #ecdcb9;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.88em;
+  color: #2e251b;
+}
+.md-body pre.md-code {
+  margin: 0.9em 0;
+  padding: 14px 16px;
+  background: #2e251b;
+  border-radius: 10px;
+  overflow-x: auto;
+  border: 1px solid #b89f6e;
+}
+.md-body pre.md-code code {
+  background: transparent;
+  color: #f0e7d6;
+  padding: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.md-body pre.md-code .hljs { background: transparent; color: #f0e7d6; }
+.md-body pre.md-code .hljs-comment, .md-body pre.md-code .hljs-quote { color: #8e7c55; }
+.md-body pre.md-code .hljs-keyword, .md-body pre.md-code .hljs-selector-tag, .md-body pre.md-code .hljs-literal, .md-body pre.md-code .hljs-section, .md-body pre.md-code .hljs-doctag, .md-body pre.md-code .hljs-type { color: #c4a0cf; }
+.md-body pre.md-code .hljs-string, .md-body pre.md-code .hljs-regexp { color: #a0c087; }
+.md-body pre.md-code .hljs-number, .md-body pre.md-code .hljs-meta { color: #e0bc7a; }
+.md-body pre.md-code .hljs-title, .md-body pre.md-code .hljs-name { color: #8eafd1; }
+.md-body pre.md-code .hljs-variable, .md-body pre.md-code .hljs-template-variable { color: #dfa0ad; }
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.9em 0;
+  font-size: 0.95em;
+}
+.md-body th, .md-body td {
+  border: 1px solid #e4dcca;
+  padding: 6px 10px;
+  text-align: left;
+}
+.md-body th { background: #ecdcb9; font-weight: 600; }
+.md-body tr:nth-child(even) td { background: rgba(236,220,185,0.3); }
+.md-body hr { border: none; border-top: 1px solid #e4dcca; margin: 1.4em 0; }
+.md-body img { max-width: 100%; border-radius: 8px; }

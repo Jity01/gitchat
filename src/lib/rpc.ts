@@ -19,6 +19,9 @@ export const fsWrite = (path: string, content: string) =>
   invoke<void>("fs_write", { path, content });
 export const fsCreateFile = (path: string) =>
   invoke<void>("fs_create_file", { path });
+export const stateLoad = () => invoke<string | null>("state_load");
+export const stateSave = (content: string) =>
+  invoke<void>("state_save", { content });
 export const pseudocode = (path: string, content: string, language: string) =>
   invoke<string>("pseudocode", { path, content, language });
 

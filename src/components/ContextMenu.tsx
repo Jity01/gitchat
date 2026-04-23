@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { C, FONT_SANS, R, SHADOW_HI } from "../theme";
 
 interface Props {
@@ -10,28 +10,36 @@ interface Props {
 }
 
 export function ContextMenu({ x, y, label = "delete chat", onDelete, onClose }: Props) {
+  const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const h = () => onClose();
+    const h = (e: MouseEvent) => {
+      // Don't close if the interaction is inside the menu itself.
+      if (rootRef.current && rootRef.current.contains(e.target as Node)) return;
+      onClose();
+    };
     const esc = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     // Close on ANY outside pointer interaction, not only left-click. Deferred
-    // slightly so the opening event doesn't immediately dismiss.
+    // slightly so the opening event doesn't immediately dismiss. Use capture
+    // phase so child handlers that call stopPropagation (e.g. node/stroke drag)
+    // don't prevent the menu from closing.
     const id = setTimeout(() => {
-      window.addEventListener("mousedown", h);
-      window.addEventListener("contextmenu", h);
+      window.addEventListener("mousedown", h, true);
+      window.addEventListener("contextmenu", h, true);
       window.addEventListener("keydown", esc);
     }, 10);
     return () => {
       clearTimeout(id);
-      window.removeEventListener("mousedown", h);
-      window.removeEventListener("contextmenu", h);
+      window.removeEventListener("mousedown", h, true);
+      window.removeEventListener("contextmenu", h, true);
       window.removeEventListener("keydown", esc);
     };
   }, [onClose]);
 
   return (
     <div
+      ref={rootRef}
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => {

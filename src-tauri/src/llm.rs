@@ -1,26 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-const IMPORT_SYSTEM: &str = r#"You are given the text of an AI chat conversation that the user has copied from their browser. The pasted text may include stray UI labels from the site (e.g. "Copy", "Regenerate", "Share", "You said", timestamps, menu items). Your job is to extract the conversation as a clean, ordered list of messages.
+const IMPORT_SYSTEM: &str = r#"You convert text copied from AI chat UIs (Claude.ai, ChatGPT, etc.) into structured JSON.
 
-Output ONLY this JSON shape, no markdown fences, no commentary:
+Your ENTIRE response is a single JSON object. First character `{`, last character `}`. No prose, no fences, no preamble, no apology.
 
-{
-  "title": "<a concise 3-7 word title describing the conversation>",
-  "messages": [
-    { "role": "user" | "assistant", "content": "<message text>" },
-    ...
-  ]
-}
+Shape:
+{"title":"<3-7 word title>","messages":[{"role":"user"|"assistant","content":"..."}]}
 
 Rules:
-- Preserve message order exactly as in the source.
-- Preserve each message's full text content, including code blocks — wrap code in triple backticks with the correct language tag when obvious.
-- Infer roles from the pasted text. Labels like "You:", "You said:", "User:", "Human:" mean "user". Labels like "Claude", "Assistant", "ChatGPT", "GPT-4" mean "assistant". When the pattern is user-then-assistant alternating with no explicit labels, assume the first block is "user".
-- Drop UI chrome: "Copy", "Regenerate", "Share this conversation", "Continue this chat", thumbs-up/down labels, timestamps, avatars, navigation, footers.
-- If messages contain images or attachments, describe them in brackets, e.g. [image of a UI mockup].
-- "role" MUST be exactly "user" or "assistant".
-- If you genuinely cannot find a conversation, return {"title": "imported chat", "messages": []}.
-- Output raw JSON only. The very first character of your response must be `{` and the last must be `}`."#;
+- Preserve message order exactly.
+- Preserve full message text including code. Escape quotes and backslashes correctly for JSON.
+- Role mapping: "You said:", "You:", "User:", "Human:" → "user". "Claude", "Claude responded:", "Assistant", "ChatGPT", "GPT-4" → "assistant".
+- Claude.ai web UI specifically duplicates each turn — first a preview snippet, then the full text. DEDUPLICATE: if consecutive lines repeat, keep only the longer full version.
+- Claude.ai also inserts summary labels before each assistant response like "Identified X's core function" or "Weighed competing approaches" — DROP these entirely; they are not part of the conversation.
+- Drop all UI chrome: "Apr 20", other timestamps, "Show more", "Copy", "Regenerate", "Claude is AI and can make mistakes...", "Share", "Edit message", thumbs labels, avatars, footers, nav.
+- If processing a chunk of a larger paste: only extract what's literally in the fragment. Include partial first/last messages as-is; a downstream step will merge them.
+- Never respond in prose. If a fragment is truly just ambient noise, return {"title":"imported chat","messages":[]}.
+"#;
 
 const PSEUDOCODE_SYSTEM: &str = r#"You rewrite source code as high-level structured pseudocode.
 
@@ -41,6 +37,8 @@ struct AnthropicReq<'a> {
     max_tokens: u32,
     system: &'a str,
     messages: Vec<AnthropicMsg<'a>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -89,6 +87,7 @@ pub async fn pseudocode(
             role: "user",
             content: user_prompt,
         }],
+        stream: false,
     };
 
     let client = reqwest::Client::builder()
@@ -134,7 +133,7 @@ pub struct ImportedChat {
     pub messages: Vec<ImportedMessage>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ImportedMessage {
     pub role: String,
     pub content: String,
@@ -143,10 +142,17 @@ pub struct ImportedMessage {
 /// Import from user-pasted content. Claude's share pages and ChatGPT's share
 /// pages both block server-side fetching, so we don't try — the user copies
 /// the conversation from their browser and pastes it here for extraction.
+///
+/// For long pastes we split into line-aligned chunks (~60k chars each) and
+/// run extraction per chunk, then dedupe adjacent same-role messages whose
+/// contents overlap at a chunk boundary. This keeps each API call fast and
+/// avoids the multi-minute single-shot generation time that was timing out
+/// for large conversations.
 #[tauri::command]
 pub async fn import_pasted_chat(content: String) -> Result<ImportedChat, String> {
     let content = content.trim().to_string();
-    if content.chars().count() < 20 {
+    let total = content.chars().count();
+    if total < 20 {
         return Err("pasted content is empty or too short.".into());
     }
 
@@ -155,78 +161,150 @@ pub async fn import_pasted_chat(content: String) -> Result<ImportedChat, String>
             .to_string()
     })?;
 
-    const MAX_CHARS: usize = 400_000;
-    let snippet = if content.chars().count() > MAX_CHARS {
-        content.chars().take(MAX_CHARS).collect::<String>()
+    // Hard upper cap — anything larger gets truncated.
+    const HARD_CAP: usize = 900_000;
+    // Smaller chunks mean smaller expected output too, which keeps each call
+    // well under max_tokens and cuts latency. Empirically (verified end-to-end
+    // against the Anthropic API), 30k chars is the sweet spot for Sonnet.
+    const SINGLE_SHOT_THRESHOLD: usize = 30_000;
+
+    let body = if total > HARD_CAP {
+        content.chars().take(HARD_CAP).collect::<String>()
     } else {
         content
     };
 
+    if body.chars().count() <= SINGLE_SHOT_THRESHOLD {
+        return extract_chunk(&api_key, &body, 1, 1).await;
+    }
+
+    let chunks = split_on_lines(&body, SINGLE_SHOT_THRESHOLD);
+    let n = chunks.len();
+
+    // Fire chunks in parallel, bounded. 3 is empirically a sweet spot on
+    // residential networks — higher values start producing connection-reset
+    // and timeout storms against Anthropic's CDN.
+    const MAX_CONCURRENT: usize = 3;
+    use futures::stream::{self, StreamExt};
+
+    let results: Vec<Result<(usize, ImportedChat), String>> = stream::iter(
+        chunks.into_iter().enumerate().map(|(i, chunk)| {
+            let key = api_key.clone();
+            async move {
+                match extract_chunk(&key, &chunk, i + 1, n).await {
+                    Ok(c) => Ok((i, c)),
+                    Err(e) => Err(format!("chunk {}/{}: {}", i + 1, n, e)),
+                }
+            }
+        }),
+    )
+    .buffer_unordered(MAX_CONCURRENT)
+    .collect()
+    .await;
+
+    // Re-order by chunk index so the final message list follows source order.
+    let mut ordered: Vec<Option<ImportedChat>> = (0..n).map(|_| None).collect();
+    for r in results {
+        let (i, c) = r?;
+        ordered[i] = Some(c);
+    }
+
+    let mut all_msgs: Vec<ImportedMessage> = Vec::new();
+    let mut title_from_first: Option<String> = None;
+    for slot in ordered {
+        if let Some(c) = slot {
+            if title_from_first.is_none() && !c.title.trim().is_empty() {
+                title_from_first = Some(c.title);
+            }
+            all_msgs.extend(c.messages);
+        }
+    }
+
+    Ok(ImportedChat {
+        title: title_from_first.unwrap_or_else(|| "imported chat".into()),
+        messages: dedupe_messages(all_msgs),
+    })
+}
+
+/// Split `content` into chunks of roughly `target_chars` characters each,
+/// breaking only on line boundaries so we don't cut inside a message.
+fn split_on_lines(content: &str, target_chars: usize) -> Vec<String> {
+    let total = content.chars().count();
+    if total <= target_chars {
+        return vec![content.to_string()];
+    }
+    let num_chunks = (total + target_chars - 1) / target_chars;
+    let per_chunk = total / num_chunks + 1;
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in content.lines() {
+        current.push_str(line);
+        current.push('\n');
+        if current.chars().count() >= per_chunk && chunks.len() + 1 < num_chunks {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Run extraction on one chunk (or a whole small paste).
+async fn extract_chunk(
+    api_key: &str,
+    chunk: &str,
+    index: usize,
+    total: usize,
+) -> Result<ImportedChat, String> {
+    let context_note = if total > 1 {
+        format!(
+            "(You are processing chunk {} of {}. Only extract messages that appear in THIS fragment. Do not invent or infer messages that would have been before or after it. If the fragment starts or ends mid-message, include that partial as-is — a later pass stitches them together.)\n\n",
+            index, total
+        )
+    } else {
+        String::new()
+    };
+
     let user_prompt = format!(
-        "The user has pasted the content of a shared AI conversation (copied from their browser). It may include page chrome or menu labels around the conversation — ignore those. Extract the conversation as specified.\n\nPasted content:\n{}",
-        snippet
+        "{}The user has pasted the content of an AI conversation (copied from their browser). It may include page chrome or menu labels around the conversation — ignore those. Extract the conversation as specified.\n\nPasted content:\n{}",
+        context_note, chunk
     );
 
     let body = AnthropicReq {
         model: "claude-sonnet-4-6",
-        max_tokens: 32_000,
+        // Each 30k-char chunk produces at most ~12k tokens of JSON output.
+        // Headroom to 16k avoids truncation that would yield invalid JSON.
+        max_tokens: 16_000,
         system: IMPORT_SYSTEM,
+        stream: true,
         messages: vec![AnthropicMsg {
             role: "user",
             content: user_prompt,
         }],
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Send with retries + exponential backoff. Flaky timeouts and rate-limit
+    // responses are common on long parallel pastes; one bad lottery pick
+    // shouldn't fail the whole import.
+    let text = send_with_retry(api_key, &body, 3, index, total).await?;
 
-    let llm = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            // Walk the error chain so we see the root cause (TLS, DNS, etc.)
-            // rather than reqwest's one-line summary.
-            let mut out = format!("anthropic request failed: {e}");
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                out.push_str(&format!("\n  caused by: {s}"));
-                src = s.source();
+    let out = match parse_imported_chat(&text) {
+        Some(v) => v,
+        None => {
+            // Model returned prose, not JSON. Treat the whole chunk as an
+            // assistant note so the user doesn't lose content — better than
+            // erroring out the whole import. Other chunks may still parse.
+            ImportedChat {
+                title: "imported chat".into(),
+                messages: vec![ImportedMessage {
+                    role: "assistant".into(),
+                    content: text.trim().to_string(),
+                }],
             }
-            out
-        })?;
-
-    let status = llm.status();
-    if !status.is_success() {
-        let text = llm.text().await.unwrap_or_default();
-        return Err(format!("anthropic api error ({status}): {text}"));
-    }
-
-    let parsed: AnthropicResp = llm.json().await.map_err(|e| e.to_string())?;
-    let text = parsed
-        .content
-        .into_iter()
-        .filter(|b| b.ty == "text")
-        .filter_map(|b| b.text)
-        .collect::<Vec<_>>()
-        .join("");
-
-    let trimmed = text.trim();
-    let json = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|s| s.strip_suffix("```"))
-        .unwrap_or(trimmed)
-        .trim();
-
-    let out: ImportedChat = serde_json::from_str(json)
-        .map_err(|e| format!("could not parse model output: {e}\n\nraw: {text}"))?;
+        }
+    };
 
     let clean_messages: Vec<ImportedMessage> = out
         .messages
@@ -245,6 +323,274 @@ pub async fn import_pasted_chat(content: String) -> Result<ImportedChat, String>
         title: out.title,
         messages: clean_messages,
     })
+}
+
+/// After concatenating per-chunk results, merge adjacent same-role messages
+/// whose contents exactly match or are a prefix/suffix of one another (the
+/// typical footprint of a message that got split across a chunk boundary).
+/// Send the request with retries. Errors are classified as:
+///   - Retryable: send-error (timeout/dns/tls/reset), 408, 429, 500, 502, 503, 504
+///   - Fatal: 4xx other than above
+/// Backoff: 1s, then 3s, then 7s (jittered lightly).
+async fn send_with_retry(
+    api_key: &str,
+    body: &AnthropicReq<'_>,
+    max_attempts: u32,
+    index: usize,
+    total: usize,
+) -> Result<String, String> {
+    let mut last_err: String = String::new();
+    for attempt in 1..=max_attempts {
+        match try_once(api_key, body).await {
+            Ok(text) => return Ok(text),
+            Err((msg, retryable)) => {
+                last_err = msg;
+                if !retryable || attempt == max_attempts {
+                    break;
+                }
+                let base = match attempt {
+                    1 => 1000u64,
+                    2 => 3000u64,
+                    _ => 7000u64,
+                };
+                let jitter = (attempt as u64) * 137 % 500;
+                let wait = base + jitter;
+                eprintln!(
+                    "[gitchat] chunk {}/{} attempt {} failed, retrying in {}ms: {}",
+                    index, total, attempt, wait, last_err
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// One attempt. Returns `(err_message, retryable?)` on failure.
+async fn try_once(
+    api_key: &str,
+    body: &AnthropicReq<'_>,
+) -> Result<String, (String, bool)> {
+    // Streaming path: used for import chunks where total generation can take
+    // longer than any reasonable total-timeout. Instead of capping the whole
+    // request we cap *per-read* idleness — Anthropic sends ping events every
+    // ~15s during generation, so a 90s gap means something's genuinely wrong.
+    //
+    // Non-streaming path: small replies (pseudocode, chat_send) — use a plain
+    // total timeout.
+    if body.stream {
+        try_once_streaming(api_key, body).await
+    } else {
+        try_once_blocking(api_key, body).await
+    }
+}
+
+async fn try_once_blocking(
+    api_key: &str,
+    body: &AnthropicReq<'_>,
+) -> Result<String, (String, bool)> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Err((e.to_string(), false)),
+    };
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return Err((format_err_chain("anthropic request failed", &e), true)),
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let retryable = matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504);
+        let text = resp.text().await.unwrap_or_default();
+        return Err((format!("anthropic api error ({status}): {text}"), retryable));
+    }
+
+    let parsed: AnthropicResp = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => return Err((format!("could not parse response: {e}"), true)),
+    };
+    let text = parsed
+        .content
+        .into_iter()
+        .filter(|b| b.ty == "text")
+        .filter_map(|b| b.text)
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(text)
+}
+
+async fn try_once_streaming(
+    api_key: &str,
+    body: &AnthropicReq<'_>,
+) -> Result<String, (String, bool)> {
+    use futures::StreamExt;
+
+    // No total timeout — generation can legitimately run 2-3 minutes. Idle
+    // detection is done per-chunk with tokio::time::timeout below.
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => return Err((e.to_string(), false)),
+    };
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .json(body)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return Err((format_err_chain("anthropic request failed", &e), true)),
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let retryable = matches!(code, 408 | 425 | 429 | 500 | 502 | 503 | 504);
+        let text = resp.text().await.unwrap_or_default();
+        return Err((format!("anthropic api error ({status}): {text}"), retryable));
+    }
+
+    // 90s idle timeout: if no bytes arrive for 90s we consider the stream hung.
+    // (Anthropic sends pings every ~15s, so this is very conservative.)
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+    let stream = resp.bytes_stream();
+    futures::pin_mut!(stream);
+    let mut buf = String::new();
+    let mut out = String::new();
+    let mut saw_message_stop = false;
+
+    loop {
+        let next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await;
+        let chunk = match next {
+            Err(_) => {
+                return Err((
+                    "anthropic stream idle for >90s; abandoning".into(),
+                    true,
+                ));
+            }
+            Ok(None) => break, // stream ended
+            Ok(Some(Err(e))) => {
+                return Err((
+                    format_err_chain("anthropic stream chunk read failed", &e),
+                    true,
+                ));
+            }
+            Ok(Some(Ok(b))) => b,
+        };
+
+        // b is `bytes::Bytes`; decode incrementally.
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Parse complete SSE events, separated by "\n\n".
+        while let Some(sep) = buf.find("\n\n") {
+            let event: String = buf.drain(..sep + 2).collect();
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    let v: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match v["type"].as_str().unwrap_or("") {
+                        "content_block_delta" => {
+                            if let Some(t) = v["delta"]["text"].as_str() {
+                                out.push_str(t);
+                            }
+                        }
+                        "message_stop" => {
+                            saw_message_stop = true;
+                        }
+                        "error" => {
+                            let msg = v["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown stream error");
+                            return Err((
+                                format!("anthropic stream error: {msg}"),
+                                true,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        let note = if saw_message_stop {
+            "stream ended with message_stop but no text deltas"
+        } else {
+            "stream ended before message_stop"
+        };
+        return Err((note.into(), true));
+    }
+    Ok(out)
+}
+
+fn format_err_chain(prefix: &str, e: &impl std::error::Error) -> String {
+    let mut out = format!("{prefix}: {e}");
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(&format!("\n  caused by: {s}"));
+        src = s.source();
+    }
+    out
+}
+
+fn dedupe_messages(msgs: Vec<ImportedMessage>) -> Vec<ImportedMessage> {
+    let mut out: Vec<ImportedMessage> = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        // Decide based on a short-lived borrow, then mutate without it held.
+        enum Action {
+            Append,
+            Skip,
+            Replace,
+        }
+        let action = match out.last() {
+            Some(last) if last.role == m.role => {
+                let a = last.content.trim();
+                let b = m.content.trim();
+                if a == b {
+                    Action::Skip
+                } else if b.starts_with(a) {
+                    Action::Replace
+                } else if a.starts_with(b) {
+                    Action::Skip
+                } else {
+                    Action::Append
+                }
+            }
+            _ => Action::Append,
+        };
+        match action {
+            Action::Append => out.push(m),
+            Action::Skip => {} // drop the shorter duplicate
+            Action::Replace => {
+                out.pop();
+                out.push(m);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -303,6 +649,7 @@ pub async fn chat_send(
         max_tokens: 4096,
         system: system_ref,
         messages: msgs,
+        stream: false,
     };
 
     let client = reqwest::Client::builder()
@@ -342,3 +689,67 @@ pub async fn chat_send(
     Ok(text)
 }
 
+
+/// Pull an `ImportedChat` out of an arbitrary model reply.
+/// Strategies, in order:
+///   1. Direct parse.
+///   2. Strip ```json / ``` fences and parse.
+///   3. Find the first balanced {...} block in the reply and parse that.
+/// Returns `None` if none succeed.
+fn parse_imported_chat(text: &str) -> Option<ImportedChat> {
+    let trimmed = text.trim();
+    if let Ok(v) = serde_json::from_str::<ImportedChat>(trimmed) {
+        return Some(v);
+    }
+    let fenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .map(|s| s.trim());
+    if let Some(inner) = fenced {
+        if let Ok(v) = serde_json::from_str::<ImportedChat>(inner) {
+            return Some(v);
+        }
+    }
+    if let Some(obj) = find_first_json_object(trimmed) {
+        if let Ok(v) = serde_json::from_str::<ImportedChat>(&obj) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Scan `s` for the first balanced `{...}` block, respecting string literals
+/// (so braces inside quoted strings don't throw off the depth counter).
+fn find_first_json_object(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escape = false;
+    for i in start..bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}

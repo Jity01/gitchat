@@ -18,27 +18,121 @@ Rules:
 - Never respond in prose. If a fragment is truly just ambient noise, return {"title":"imported chat","messages":[]}.
 "#;
 
-const PSEUDOCODE_SYSTEM: &str = r#"You rewrite source code as high-level structured pseudocode.
+const PSEUDOCODE_SYSTEM: &str = r#"You rewrite source code as structured pseudocode whose shape mirrors the source.
 
-Rules:
-1. Preserve the control flow and logic of the source.
-2. Be substantially more succinct than the original — abstract away syntactic boilerplate (type annotations, trivial imports, visibility modifiers, unnecessary parentheses, decorators that are purely mechanical).
-3. Use UPPERCASE keywords: FUNCTION, IF, ELSE, ELIF, FOR, WHILE, RETURN, CLASS, IMPORT, TRY, CATCH, THROW, AWAIT, ASYNC, CONST, LET, MATCH.
-4. Use INDENTATION (2 spaces) to show block structure. No braces, no semicolons.
-5. One logical step per line. Collapse trivial multi-line constructions into a single descriptive line.
-6. Keep identifiers from the source (function names, variable names, key string literals) so the correspondence is clear.
-7. Annotate non-obvious intent in a short parenthetical — but be terse.
-8. If the file is config/data/markup (not program logic), respond with a 2–3 sentence description of what it contains instead of pseudocode.
-9. Output ONLY the pseudocode block (or description) — no markdown fences, no preamble, no trailing commentary."#;
+Output format:
+- Mirror the source's structure: every function, IF/ELSE/FOR/WHILE/MATCH branch, struct literal, and RETURN appears as its own line or indented block. Do not flatten branches into a single line.
+- Use 2-space indentation to show nesting. No braces, no semicolons.
+- UPPERCASE keywords: FUNCTION, ASYNC, AWAIT, IF, ELSE, ELIF, FOR, WHILE, MATCH, RETURN, BREAK, CONTINUE, CLASS, TRY, CATCH, THROW.
+- Write right-hand sides as short descriptive English clauses — NOT re-typed expressions. Prefer "user_prompt = the context note, then the preamble, then the chunk" over "user_prompt = context_note + preamble + chunk".
+- Keep source identifiers (function names, variable names, struct names, important string keys) so the correspondence with the source is obvious.
+- For struct/object literals, lay fields out one per line; the value of each field is a short English clause.
+- When calling a function, only echo arguments that aren't obvious from the function name. Prefer "send_with_retry(body, up to 3 attempts)" over "send_with_retry(api_key, body, max_attempts=3, index, total)".
+- Side effects (logging, sleeping, mutation) get a one-clause line: "log the retry", "SLEEP for that wait".
+
+Length:
+- Substantially shorter than the source.
+- One logical step per line. Do not fragment a single thought across lines, and do not pack unrelated steps onto one line.
+- Drop type annotations, visibility modifiers, mechanical decorators, trivial imports, and error-wrapping that just rebrands a string.
+
+Example — given source like:
+
+  async fn extract_chunk(api_key: &str, chunk: &str, index: usize, total: usize) -> Result<ImportedChat, String> {
+      let context_note = if total > 1 {
+          format!("(processing chunk {}/{} — only extract from this fragment)", index, total)
+      } else {
+          String::new()
+      };
+      let user_prompt = format!("{}{}{}", context_note, preamble, chunk);
+      let body = AnthropicReq {
+          model: "claude-sonnet-4-6",
+          max_tokens: 16000,
+          system: IMPORT_SYSTEM,
+          stream: true,
+          messages: vec![user_msg(user_prompt)],
+      };
+      let text = send_with_retry(api_key, &body, 3, index, total).await?;
+      let out = parse_imported_chat(&text).unwrap_or_else(|| fallback(text));
+      let clean = sanitize_roles(out.messages);
+      Ok(ImportedChat { title: out.title, messages: clean })
+  }
+
+Output:
+
+  ASYNC FUNCTION extract_chunk(api_key, chunk, index, total)
+    IF total > 1
+      context_note = a short hint telling the model this is chunk i of n
+                     and to only extract messages from this fragment
+    ELSE
+      context_note = empty string
+
+    user_prompt = the context note, then the preamble, then the chunk
+
+    body = AnthropicReq {
+      model: claude-sonnet-4-6
+      max_tokens: 16000
+      system: the IMPORT_SYSTEM prompt
+      stream: true
+      messages: a single user message containing user_prompt
+    }
+
+    text = AWAIT send_with_retry(body, up to 3 attempts)
+
+    out = try to parse text as an ImportedChat,
+          falling back to wrapping the whole reply as one assistant message
+
+    clean = walk out.messages and coerce any role that isn't user or assistant
+            into "assistant"
+
+    RETURN an ImportedChat with the parsed title and the cleaned messages
+
+Other content types:
+- If the file is config, data, or markup (not program logic), respond with a 2–3 sentence description of what it contains instead of pseudocode.
+
+Output ONLY the pseudocode block (or description) — no markdown fences, no preamble, no trailing commentary."#;
 
 #[derive(Serialize)]
 struct AnthropicReq<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: &'a str,
+    system: SystemField<'a>,
     messages: Vec<AnthropicMsg<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SystemField<'a> {
+    Plain(&'a str),
+    Blocks(Vec<SystemBlock<'a>>),
+}
+
+#[derive(Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    ty: &'a str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    ty: &'static str,
+}
+
+/// Wrap a static system prompt in an ephemeral cache block so the Anthropic
+/// prompt cache can serve the prefix on repeat calls. Note: caching only kicks
+/// in once the prefix exceeds the model's minimum cacheable size (~1024 tokens
+/// for Sonnet); shorter prompts are sent through unchanged with no penalty.
+fn cached_system(prompt: &str) -> SystemField<'_> {
+    SystemField::Blocks(vec![SystemBlock {
+        ty: "text",
+        text: prompt,
+        cache_control: Some(CacheControl { ty: "ephemeral" }),
+    }])
 }
 
 #[derive(Serialize)]
@@ -82,7 +176,7 @@ pub async fn pseudocode(
     let body = AnthropicReq {
         model: "claude-sonnet-4-6",
         max_tokens: 4096,
-        system: PSEUDOCODE_SYSTEM,
+        system: cached_system(PSEUDOCODE_SYSTEM),
         messages: vec![AnthropicMsg {
             role: "user",
             content: user_prompt,
@@ -277,7 +371,7 @@ async fn extract_chunk(
         // Each 30k-char chunk produces at most ~12k tokens of JSON output.
         // Headroom to 16k avoids truncation that would yield invalid JSON.
         max_tokens: 16_000,
-        system: IMPORT_SYSTEM,
+        system: cached_system(IMPORT_SYSTEM),
         stream: true,
         messages: vec![AnthropicMsg {
             role: "user",
@@ -647,7 +741,7 @@ pub async fn chat_send(
     let body = AnthropicReq {
         model: api_model,
         max_tokens: 4096,
-        system: system_ref,
+        system: SystemField::Plain(system_ref),
         messages: msgs,
         stream: false,
     };

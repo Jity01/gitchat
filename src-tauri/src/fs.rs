@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use tauri::{AppHandle, Manager};
 
 const IGNORE: &[&str] = &[
     ".git",
@@ -126,5 +127,34 @@ pub fn fs_create_file(path: String) -> Result<(), String> {
         .create_new(true)
         .open(p)
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn state_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("state.json"))
+}
+
+#[tauri::command]
+pub fn state_load(app: AppHandle) -> Result<Option<String>, String> {
+    let p = state_path(&app)?;
+    if !p.exists() {
+        return Ok(None);
+    }
+    let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    Ok(Some(s))
+}
+
+#[tauri::command]
+pub fn state_save(app: AppHandle, content: String) -> Result<(), String> {
+    let p = state_path(&app)?;
+    // write to a tmp file then rename for atomicity
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
     Ok(())
 }

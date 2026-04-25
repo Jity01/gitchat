@@ -41,3 +41,25 @@ export const chatSend = (args: {
   system?: string;
   messages: ChatMessagePayload[];
 }) => invoke<string>("chat_send", args);
+
+export const claudeSend = (args: {
+  requestId: string;
+  chatId: string;
+  cwd: string;
+  permissionMode: "plan" | "accept" | "bypass";
+  sessionId?: string;
+  system?: string;
+  userMessage: string;
+}) =>
+  invoke<void>("claude_send", {
+    requestId: args.requestId,
+    chatId: args.chatId,
+    cwd: args.cwd,
+    permissionMode: args.permissionMode,
+    sessionId: args.sessionId,
+    system: args.system,
+    userMessage: args.userMessage,
+  });
+
+export const claudeCancel = (requestId: string) =>
+  invoke<void>("claude_cancel", { requestId });

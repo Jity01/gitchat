@@ -1,8 +1,10 @@
+mod claude_agent;
 mod env;
 mod fs;
 mod llm;
 mod pty;
 
+use claude_agent::{claude_cancel, claude_send, AgentState};
 use fs::{fs_create_file, fs_list, fs_read, fs_write, state_load, state_save};
 use llm::{chat_send, import_pasted_chat, pseudocode};
 use pty::{pty_close, pty_open, pty_resize, pty_write, PtyState};
@@ -14,6 +16,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(PtyState::default())
+        .manage(AgentState::default())
         .invoke_handler(tauri::generate_handler![
             pty_open,
             pty_write,
@@ -27,7 +30,9 @@ pub fn run() {
             state_save,
             pseudocode,
             import_pasted_chat,
-            chat_send
+            chat_send,
+            claude_send,
+            claude_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

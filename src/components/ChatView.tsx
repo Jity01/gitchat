@@ -19,8 +19,12 @@ import { FileViewer, createCache, type FileView } from "./FileViewer";
 import { TabBar, type Tab } from "./TabBar";
 import { ContextRing } from "./ContextRing";
 import { estChatContextTokens } from "../lib/tokens";
-import { chatSend } from "../lib/rpc";
+import { chatSend, claudeCancel, claudeSend } from "../lib/rpc";
 import { buildSystemPrompt } from "../lib/assemble";
+import { reduceClaudeEvent } from "../lib/claudeStream";
+import { ToolCallBlock } from "./ToolCallBlock";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { ContentBlock } from "../types";
 
 interface Props {
   chat: Chat;
@@ -32,6 +36,8 @@ interface Props {
   onSetCwd: (id: string, cwd: string) => void;
   onSetPermissionMode: (id: string, mode: PermissionMode) => void;
   onAppend: (id: string, m: Message) => void;
+  onSetLastMessage: (id: string, m: Message) => void;
+  onSetAgentSessionId: (id: string, sid: string) => void;
 }
 
 const SPLIT_KEY = (id: string) => `gitchat.split.${id}`;
@@ -47,6 +53,8 @@ export function ChatView({
   onSetCwd,
   onSetPermissionMode,
   onAppend,
+  onSetLastMessage,
+  onSetAgentSessionId,
 }: Props) {
   const [input, setInput] = useState("");
   const [pv, setPv] =
@@ -160,6 +168,171 @@ export function ChatView({
     }
   };
 
+  // Tracks an in-flight Claude Code agent run so we can cancel on unmount /
+  // model switch. The draft holds the streaming assistant message we mutate
+  // event-by-event before pushing it back via onSetLastMessage.
+  const streamRef = useRef<{
+    requestId: string;
+    draft: Message;
+    unlisteners: UnlistenFn[];
+  } | null>(null);
+
+  const cleanupStream = () => {
+    const s = streamRef.current;
+    if (!s) return;
+    s.unlisteners.forEach((u) => {
+      try {
+        u();
+      } catch {
+        /* noop */
+      }
+    });
+    streamRef.current = null;
+  };
+
+  // Cancel any in-flight agent run when this view unmounts or the chat
+  // switches. Closes the subprocess via Tauri (kill_on_drop also covers it,
+  // but explicit cancel is faster).
+  useEffect(() => {
+    return () => {
+      const s = streamRef.current;
+      if (s) {
+        claudeCancel(s.requestId).catch(() => {});
+        cleanupStream();
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.id]);
+
+  const sendPlain = async (trimmed: string, userMsg: Message) => {
+    const system = buildSystemPrompt(chat, edges, allChats);
+    const payloadMessages = [...chat.messages, userMsg].map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content,
+    }));
+    const reply = await chatSend({
+      model: chat.model,
+      system: system || undefined,
+      messages: payloadMessages,
+    });
+    onAppend(chat.id, { role: "assistant", content: reply });
+    void trimmed;
+  };
+
+  const sendCode = async (trimmed: string) => {
+    if (!chat.cwd) {
+      onAppend(chat.id, {
+        role: "assistant",
+        content: "⚠️ claude code chats need a working directory. Pick one above.",
+      });
+      return;
+    }
+
+    const requestId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+    // Push an empty placeholder we'll mutate as events arrive.
+    const draft: Message = {
+      role: "assistant",
+      content: "",
+      blocks: [],
+      streaming: true,
+    };
+    onAppend(chat.id, draft);
+
+    const unlisteners: UnlistenFn[] = [];
+    streamRef.current = { requestId, draft, unlisteners };
+
+    const flush = () => {
+      const s = streamRef.current;
+      if (!s) return;
+      onSetLastMessage(chat.id, s.draft);
+    };
+
+    const offEvent = await listen<unknown>(
+      `claude://${requestId}/event`,
+      (e) => {
+        const s = streamRef.current;
+        if (!s || s.requestId !== requestId) return;
+        const out = reduceClaudeEvent(s.draft, e.payload);
+        s.draft = out.message;
+        if (out.sessionId && !chat.agentSessionId) {
+          onSetAgentSessionId(chat.id, out.sessionId);
+        }
+        if (out.error) {
+          s.draft = {
+            ...s.draft,
+            content: (s.draft.content || "") + `\n\n⚠️ ${out.error}`,
+          };
+        }
+        flush();
+      },
+    );
+    unlisteners.push(offEvent);
+
+    const offStderr = await listen<string>(
+      `claude://${requestId}/stderr`,
+      (e) => {
+        // eslint-disable-next-line no-console
+        console.warn("[claude stderr]", e.payload);
+      },
+    );
+    unlisteners.push(offStderr);
+
+    const offExit = await listen<{ code: number | null; killed: boolean }>(
+      `claude://${requestId}/exit`,
+      (e) => {
+        const s = streamRef.current;
+        if (!s || s.requestId !== requestId) return;
+        const exited: Message = { ...s.draft, streaming: false };
+        if (e.payload?.killed) {
+          exited.content = (exited.content || "") + "\n\n(cancelled)";
+        } else if (
+          e.payload?.code != null &&
+          e.payload.code !== 0 &&
+          (!exited.blocks || exited.blocks.length === 0)
+        ) {
+          exited.content =
+            (exited.content || "") +
+            `⚠️ claude exited with code ${e.payload.code}. Check stderr in devtools.`;
+        }
+        s.draft = exited;
+        onSetLastMessage(chat.id, exited);
+        cleanupStream();
+        setSending(false);
+      },
+    );
+    unlisteners.push(offExit);
+
+    try {
+      const system = buildSystemPrompt(chat, edges, allChats);
+      await claudeSend({
+        requestId,
+        chatId: chat.id,
+        cwd: chat.cwd,
+        permissionMode,
+        sessionId: chat.agentSessionId || undefined,
+        system: system || undefined,
+        userMessage: trimmed,
+      });
+    } catch (e) {
+      const s = streamRef.current;
+      if (s) {
+        const errored: Message = {
+          ...s.draft,
+          streaming: false,
+          content: (s.draft.content || "") + `⚠️ ${String(e)}`,
+        };
+        s.draft = errored;
+        onSetLastMessage(chat.id, errored);
+      }
+      cleanupStream();
+      setSending(false);
+    }
+  };
+
   const send = async () => {
     const trimmed = input.trim();
     if (!trimmed || sending) return;
@@ -171,28 +344,18 @@ export function ChatView({
     setSending(true);
 
     try {
-      // Build the request from:
-      //   • inbound-edge context as the system prompt
-      //   • full chat history so far (including the user message we just appended)
-      const system = buildSystemPrompt(chat, edges, allChats);
-      const payloadMessages = [...chat.messages, userMsg].map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      }));
-
-      const reply = await chatSend({
-        model: chat.model,
-        system: system || undefined,
-        messages: payloadMessages,
-      });
-
-      onAppend(chat.id, { role: "assistant", content: reply });
+      if (isCode) {
+        // sendCode resolves setSending(false) via the exit listener.
+        await sendCode(trimmed);
+      } else {
+        await sendPlain(trimmed, userMsg);
+        setSending(false);
+      }
     } catch (e) {
       onAppend(chat.id, {
         role: "assistant",
         content: `⚠️ request failed: ${String(e)}`,
       });
-    } finally {
       setSending(false);
     }
   };
@@ -777,6 +940,7 @@ function Dot({ delay }: { delay: string }) {
 
 function MessageBubble({ m }: { m: Message }) {
   const isUser = m.role === "user";
+  const hasBlocks = !isUser && Array.isArray(m.blocks) && m.blocks.length > 0;
   return (
     <div
       style={{
@@ -799,9 +963,50 @@ function MessageBubble({ m }: { m: Message }) {
           boxShadow: isUser ? "none" : SHADOW,
         }}
       >
-        {renderContent(m.content)}
+        {hasBlocks ? renderBlocks(m.blocks!) : renderContent(m.content)}
+        {m.streaming && <StreamingCursor />}
       </div>
     </div>
+  );
+}
+
+function renderBlocks(blocks: ContentBlock[]): React.ReactNode[] {
+  // Pair tool_use with its tool_result by id so the card can show both.
+  const resultsByUseId = new Map<
+    string,
+    Extract<ContentBlock, { type: "tool_result" }>
+  >();
+  for (const b of blocks) {
+    if (b.type === "tool_result") resultsByUseId.set(b.tool_use_id, b);
+  }
+  const out: React.ReactNode[] = [];
+  blocks.forEach((b, i) => {
+    if (b.type === "text") {
+      const inner = renderContent(b.text);
+      out.push(<div key={i}>{inner}</div>);
+    } else if (b.type === "tool_use") {
+      out.push(
+        <ToolCallBlock key={i} use={b} result={resultsByUseId.get(b.id)} />,
+      );
+    }
+    // tool_result blocks are rendered alongside their tool_use, not standalone.
+  });
+  return out;
+}
+
+function StreamingCursor() {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: 7,
+        height: 13,
+        marginLeft: 2,
+        verticalAlign: "text-bottom",
+        background: C.textMut,
+        animation: "gitchat-cursor 1s steps(2) infinite",
+      }}
+    />
   );
 }
 

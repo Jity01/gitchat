@@ -120,6 +120,21 @@ export default function App() {
       ),
     );
   };
+  const onSetLastMessage = (id: string, m: Message) => {
+    setChats((p) =>
+      p.map((c) => {
+        if (c.id !== id || c.messages.length === 0) return c;
+        const next = c.messages.slice();
+        next[next.length - 1] = m;
+        return { ...c, messages: next, updatedAt: Date.now() };
+      }),
+    );
+  };
+  const onSetAgentSessionId = (id: string, sid: string) => {
+    setChats((p) =>
+      p.map((c) => (c.id === id ? { ...c, agentSessionId: sid } : c)),
+    );
+  };
 
   // annotations
   const onAddStroke = (s: Stroke) => setStrokes((p) => [...p, s]);
@@ -196,6 +211,8 @@ export default function App() {
           onSetCwd={onSetCwd}
           onSetPermissionMode={onSetPermissionMode}
           onAppend={onAppend}
+          onSetLastMessage={onSetLastMessage}
+          onSetAgentSessionId={onSetAgentSessionId}
         />
       )}
     </>

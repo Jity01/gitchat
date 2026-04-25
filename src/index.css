@@ -25,6 +25,12 @@ input, textarea { font-family: inherit; }
 /* selection */
 ::selection { background: rgba(183,122,60,0.30); color: #2e251b; }
 
+/* streaming cursor for in-flight agent messages */
+@keyframes gitchat-cursor {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
 /* xterm */
 .xterm-viewport { scrollbar-width: thin; }
 .xterm-viewport::-webkit-scrollbar { width: 8px; }
